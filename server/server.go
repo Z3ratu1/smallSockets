@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"github.com/hashicorp/yamux"
 	"github.com/sirupsen/logrus"
 	"io"
@@ -52,7 +53,6 @@ func handleClientConn(conn net.Conn, auth string) {
 		_ = conn.Close()
 		serverLogger.Debugf("client connection from %s closed", conn.RemoteAddr())
 	}()
-	defer conn.Close()
 	// create client
 	client, err := yamux.Client(conn, nil)
 	if err != nil {
@@ -64,7 +64,6 @@ func handleClientConn(conn net.Conn, auth string) {
 		_ = client.Close()
 		serverLogger.Debugf("yamux client from %s closed", client.RemoteAddr())
 	}()
-	defer client.Close()
 	serverLogger.Debug("yamux Client opened")
 
 	communicate, err := client.Open()
@@ -77,7 +76,6 @@ func handleClientConn(conn net.Conn, auth string) {
 		_ = communicate.Close()
 		serverLogger.Debugf("communication connection from %s closed", communicate.RemoteAddr())
 	}()
-	defer communicate.Close()
 	serverLogger.Debugf("communication connection from %s opened", communicate.RemoteAddr())
 	// 用于控制socksListener的关闭
 	// 先开一个连接进行通信，协商端口，错误回传之类的，如果这个通信连接挂了，也就意味着client连接挂了（大概）
@@ -99,7 +97,6 @@ func handleClientConn(conn net.Conn, auth string) {
 		serverLogger.Infof("proxy at 0.0.0.0:%d stopped", port)
 	}()
 	serverLogger.Infof("socks5 proxy start at 0.0.0.0:%d", port)
-	defer socksListener.Close()
 	for {
 		// 连上来的client挂掉后，socksListener应当被关闭，然后对应该error return掉，将之前的资源全部释放掉
 		err = handleProxyConn(ctx, socksListener, client)
@@ -115,25 +112,34 @@ func handleClientConn(conn net.Conn, auth string) {
 }
 
 func handleCommunicationConn(conn net.Conn, auth string, cancelFunc context.CancelFunc) (int, error) {
-	// 在这里做可选的client auth
+	// auth check
+	serverLogger.Debugf("try to auth client with auth %s", auth)
+	clientAuth, err := readFromClient(conn)
+	if err != nil {
+		return 0, errors.New("read client auth failed")
+	}
+	serverLogger.Debugf("get client auth %s", clientAuth)
+	authResult := make([]byte, 4)
+	if auth != clientAuth {
+		binary.BigEndian.PutUint32(authResult, 0)
+		_, _ = conn.Write(authResult)
+		return 0, fmt.Errorf("invalid client auth: %s", clientAuth)
+	} else {
+		serverLogger.Debug("auth client success")
+		binary.BigEndian.PutUint32(authResult, 1)
+		_, err = conn.Write(authResult)
+		if err != nil {
+			return 0, err
+		}
+	}
+
 	portBytes := make([]byte, 2)
-	_, err := conn.Read(portBytes)
+	_, err = conn.Read(portBytes)
 	if err != nil {
 		return 0, nil
 	}
-	if auth != "" {
-		serverLogger.Debugf("try to auth client with auth %s", auth)
-		clientAuth, err := readFromClient(conn)
-		if err != nil {
-			return 0, errors.New("read client auth failed")
-		}
-		serverLogger.Debugf("get client auth %s", clientAuth)
-		if auth != clientAuth {
-			return 0, errors.New("invalid client auth")
-		}
-		serverLogger.Debug("auth client success")
-	}
 	port := binary.BigEndian.Uint16(portBytes)
+	serverLogger.Debugf("recieve socks5 proxy port %d", port)
 	// 起一个协程持续读client发的消息并输出到errChan
 	go func() {
 		for {
@@ -146,6 +152,7 @@ func handleCommunicationConn(conn net.Conn, auth string, cancelFunc context.Canc
 				} else {
 					serverLogger.Infof("client connection from %s closed", conn.RemoteAddr())
 				}
+				// 这个函数会把整个client的连接全都关掉
 				cancelFunc()
 				return
 			}
@@ -192,13 +199,15 @@ func join(src net.Conn, dst net.Conn) {
 	wg.Wait()
 }
 
-func pipe(src io.ReadWriteCloser, dst io.ReadWriteCloser, group *sync.WaitGroup) {
+func pipe(src net.Conn, dst net.Conn, group *sync.WaitGroup) {
 	defer group.Done()
 	buff := make([]byte, 4096)
 	_, err := io.CopyBuffer(dst, src, buff)
 	if err != nil {
 		if !errors.Is(err, net.ErrClosed) {
 			errorChan <- err
+		} else {
+			serverLogger.Debugf("connection from %s to %s closed", src.RemoteAddr(), dst.RemoteAddr())
 		}
 	}
 }
@@ -210,12 +219,16 @@ func readFromClient(conn net.Conn) (string, error) {
 		return "", err
 	}
 	dataLen := binary.BigEndian.Uint32(dataLenBytes)
-	data := make([]byte, dataLen)
-	_, err = conn.Read(data)
-	if err != nil {
+	if dataLen != 0 {
+		data := make([]byte, dataLen)
+		_, err = conn.Read(data)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	} else {
 		return "", err
 	}
-	return string(data), nil
 }
 
 func handleErrorMsg() {
@@ -223,7 +236,6 @@ func handleErrorMsg() {
 	for {
 		select {
 		case err, ok := <-errorChan:
-			// 应该是channel关闭时会读出来一个零值然后ok为false?
 			if ok {
 				serverLogger.Error(err)
 			} else {

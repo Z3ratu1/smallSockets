@@ -2,6 +2,8 @@ package client
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"github.com/armon/go-socks5"
 	"github.com/hashicorp/yamux"
 	"log"
@@ -9,8 +11,6 @@ import (
 )
 
 func StartClient(remoteAddr string, remoteSocksPort int, username string, password string, serverAuth string) error {
-	//seed := rand.New(rand.NewSource(time.Now().UnixNano()))
-	//clientID := strconv.FormatUint(seed.Uint64(), 16)
 	conn, err := net.Dial("tcp", remoteAddr)
 	if err != nil {
 		return err
@@ -31,7 +31,7 @@ func StartClient(remoteAddr string, remoteSocksPort int, username string, passwo
 	if err != nil {
 		return err
 	}
-	clientLogger := log.New(&remoteLogger{conn: communicate}, "", log.Lshortfile|log.Ltime)
+	clientLogger := log.New(&remoteLogger{conn: communicate}, "Client: ", log.Lshortfile)
 	var proxyAuth socks5.Authenticator
 	if username != "" && password != "" {
 		proxyAuth = socks5.UserPassAuthenticator{Credentials: socks5.StaticCredentials{username: password}}
@@ -39,7 +39,6 @@ func StartClient(remoteAddr string, remoteSocksPort int, username string, passwo
 		proxyAuth = socks5.NoAuthAuthenticator{}
 	}
 	// 这里先用普通的logger写过去，然后那边读出来再由logrus处理输出
-	// TODO clientLogger往server写内容好像会出错
 	socks5Server, err := socks5.New(&socks5.Config{Logger: clientLogger, AuthMethods: []socks5.Authenticator{proxyAuth}})
 	if err != nil {
 		clientLogger.Println(err)
@@ -60,17 +59,25 @@ func sendToServer(data string, conn net.Conn) (int, error) {
 }
 
 func initConn(conn net.Conn, port int, auth string) error {
-	portBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(portBytes, uint16(port))
-	_, err := conn.Write(portBytes)
+	// do auth with server
+	_, err := sendToServer(auth, conn)
 	if err != nil {
 		return err
 	}
-	if auth != "" {
-		_, err = sendToServer(auth, conn)
-		if err != nil {
-			return err
-		}
+	authResult := make([]byte, 4)
+	_, err = conn.Read(authResult)
+	if err != nil {
+		return errors.New("auth failed")
+	}
+	if binary.BigEndian.Uint32(authResult) == 0 {
+		_ = conn.Close()
+		return fmt.Errorf("auth server with secret: %s failed", auth)
+	}
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, uint16(port))
+	_, err = conn.Write(portBytes)
+	if err != nil {
+		return err
 	}
 	return nil
 }
