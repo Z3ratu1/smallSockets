@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/RedTeamPentesting/kbtls"
 	"github.com/hashicorp/yamux"
 	"github.com/sirupsen/logrus"
 	"io"
@@ -21,17 +23,22 @@ func StartServer(port int, auth string, logLevel logrus.Level) error {
 	serverLogger.SetLevel(logLevel)
 	defer close(errorChan)
 	go handleErrorMsg()
-	clientListener, err := net.Listen("tcp", "0.0.0.0:"+strconv.Itoa(port))
+	config, key, err := serverTLSConfig(auth)
 	if err != nil {
 		return err
 	}
-	serverLogger.Infof("client listener start at 0.0.0.0:%d", port)
+	logrus.Infof("server auth key: %s", key)
+	clientListener, err := tls.Listen("tcp", "0.0.0.0:"+strconv.Itoa(port), config)
+	if err != nil {
+		return err
+	}
+	serverLogger.Infof("listener start at 0.0.0.0:%d", port)
 	defer clientListener.Close()
 	for {
 		conn, err := clientListener.Accept()
 		if err != nil {
 			// 这里所有的error都不影响程序继续运行，仅log
-			// 如果error是Closed就直接跳过了
+			// 如果listener挂了，就会出现closed err，程序退出
 			if !errors.Is(err, net.ErrClosed) {
 				serverLogger.Error(err)
 				continue
@@ -41,11 +48,11 @@ func StartServer(port int, auth string, logLevel logrus.Level) error {
 			}
 		}
 		serverLogger.Infof("client from %s connected", conn.RemoteAddr())
-		go handleClientConn(conn, auth)
+		go handleClientConn(conn)
 	}
 }
 
-func handleClientConn(conn net.Conn, auth string) {
+func handleClientConn(conn net.Conn) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
@@ -79,13 +86,14 @@ func handleClientConn(conn net.Conn, auth string) {
 	serverLogger.Debugf("communication connection from %s opened", communicate.RemoteAddr())
 	// 用于控制socksListener的关闭
 	// 先开一个连接进行通信，协商端口，错误回传之类的，如果这个通信连接挂了，也就意味着client连接挂了（大概）
-	port, err := handleCommunicationConn(communicate, auth, cancel)
+	port, err := handleCommunicationConn(communicate, cancel)
 	if err != nil {
 		serverLogger.Debug("communication with client failed")
 		errorChan <- err
 		return
 	}
 
+	// 这里是socks5代理，得起普通的tcp监听
 	socksListener, err := net.Listen("tcp", "0.0.0.0:"+strconv.Itoa(port))
 	if err != nil {
 		errorChan <- err
@@ -96,47 +104,45 @@ func handleClientConn(conn net.Conn, auth string) {
 		_ = socksListener.Close()
 		serverLogger.Infof("proxy at 0.0.0.0:%d stopped", port)
 	}()
-	serverLogger.Infof("socks5 proxy start at 0.0.0.0:%d", port)
-	for {
-		// 连上来的client挂掉后，socksListener应当被关闭，然后对应该error return掉，将之前的资源全部释放掉
-		err = handleProxyConn(ctx, socksListener, client)
-		if err != nil {
-			// 这里不能随便return，一旦return之前的defer close就全关了，只有当listener挂掉的时候才返回
-			if !errors.Is(err, net.ErrClosed) {
-				errorChan <- err
-			} else {
-				return
-			}
+	serverLogger.Infof("socks5 proxy for client from %s start at 0.0.0.0:%d", conn.RemoteAddr(), port)
+	err = handleProxyConn(ctx, socksListener, client)
+	if err != nil {
+		if errors.Is(err, net.ErrClosed) {
+			logrus.Debugf("proxy listener at %d closed", port)
+		} else {
+			errorChan <- err
 		}
+		return
 	}
 }
 
-func handleCommunicationConn(conn net.Conn, auth string, cancelFunc context.CancelFunc) (int, error) {
+func handleCommunicationConn(conn net.Conn, cancelFunc context.CancelFunc) (int, error) {
 	// auth check
-	serverLogger.Debugf("try to auth client with auth %s", auth)
-	clientAuth, err := readFromClient(conn)
-	if err != nil {
-		return 0, errors.New("read client auth failed")
-	}
-	serverLogger.Debugf("get client auth %s", clientAuth)
-	authResult := make([]byte, 4)
-	if auth != clientAuth {
-		binary.BigEndian.PutUint32(authResult, 0)
-		_, _ = conn.Write(authResult)
-		return 0, fmt.Errorf("invalid client auth: %s", clientAuth)
-	} else {
-		serverLogger.Debug("auth client success")
-		binary.BigEndian.PutUint32(authResult, 1)
-		_, err = conn.Write(authResult)
-		if err != nil {
-			return 0, err
-		}
-	}
+	//serverLogger.Debugf("try to auth client with auth %s", auth)
+	//clientAuth, err := readFromClient(conn)
+	//if err != nil {
+	//	return 0, errors.New("read client auth failed")
+	//}
+	//serverLogger.Debugf("get client auth %s", clientAuth)
+	//authResult := make([]byte, 4)
+	//if auth != clientAuth {
+	//	binary.BigEndian.PutUint32(authResult, 0)
+	//	_, _ = conn.Write(authResult)
+	//	return 0, fmt.Errorf("invalid client auth: %s", clientAuth)
+	//} else {
+	//	serverLogger.Debug("auth client success")
+	//	binary.BigEndian.PutUint32(authResult, 1)
+	//	_, err = conn.Write(authResult)
+	//	if err != nil {
+	//		return 0, err
+	//	}
+	//}
 
+	// 改用tls进行身份验证，这样子的话就不需要读auth了，直接读port
 	portBytes := make([]byte, 2)
-	_, err = conn.Read(portBytes)
+	_, err := conn.Read(portBytes)
 	if err != nil {
-		return 0, nil
+		return 0, err
 	}
 	port := binary.BigEndian.Uint16(portBytes)
 	serverLogger.Debugf("recieve socks5 proxy port %d", port)
@@ -157,35 +163,43 @@ func handleCommunicationConn(conn net.Conn, auth string, cancelFunc context.Canc
 				return
 			}
 			// 读出来的消息以info等级输出
-			serverLogger.Info(data)
+			serverLogger.Infof("error from client %s: %s", conn.RemoteAddr(), data)
 		}
 	}()
 	return int(port), nil
 }
 
 func handleProxyConn(ctx context.Context, socksListener net.Listener, session *yamux.Session) error {
-	src, err := socksListener.Accept()
-	if err != nil {
-		return err
+	for {
+		// 监听listener，直到listener挂掉
+		src, err := socksListener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				logrus.Debugf("proxy listener at %s closed", socksListener.Addr())
+			}
+			return err
+		}
+		go func() {
+			<-ctx.Done()
+			src.Close()
+			serverLogger.Debugf("proxy src connection from %s closed", src.RemoteAddr())
+		}()
+		serverLogger.Debugf("accept proxy request from %s", src.RemoteAddr())
+		dst, err := session.Open()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				logrus.Debugf("client session from %s closed", session.RemoteAddr())
+			}
+			return err
+		}
+		go func() {
+			<-ctx.Done()
+			dst.Close()
+			serverLogger.Debugf("proxy dst connection from %s closed", dst.RemoteAddr())
+		}()
+		serverLogger.Debugf("open proxy connection to %s", session.RemoteAddr())
+		go join(src, dst)
 	}
-	go func() {
-		<-ctx.Done()
-		src.Close()
-		serverLogger.Debugf("proxy src connection from %s closed", src.RemoteAddr())
-	}()
-	serverLogger.Debugf("accept proxy request from %s", src.RemoteAddr())
-	dst, err := session.Open()
-	if err != nil {
-		return err
-	}
-	go func() {
-		<-ctx.Done()
-		dst.Close()
-		serverLogger.Debugf("proxy dst connection from %s closed", dst.RemoteAddr())
-	}()
-	serverLogger.Debugf("open proxy connection to %s", session.RemoteAddr())
-	go join(src, dst)
-	return nil
 }
 
 func join(src net.Conn, dst net.Conn) {
@@ -245,4 +259,30 @@ func handleErrorMsg() {
 			}
 		}
 	}
+}
+
+func serverTLSConfig(connectionKey string) (*tls.Config, kbtls.ConnectionKey, error) {
+	var (
+		key kbtls.ConnectionKey
+		err error
+	)
+
+	if connectionKey != "" {
+		key, err = kbtls.ParseConnectionKey(connectionKey)
+		if err != nil {
+			return nil, key, fmt.Errorf("parse connection key: %w", err)
+		}
+	} else {
+		key, err = kbtls.GenerateConnectionKey()
+		if err != nil {
+			return nil, key, fmt.Errorf("generate connection key: %w", err)
+		}
+	}
+
+	cfg, err := kbtls.ServerTLSConfig(key)
+	if err != nil {
+		return nil, key, fmt.Errorf("configure TLS: %w", err)
+	}
+
+	return cfg, key, nil
 }

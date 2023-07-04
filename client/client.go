@@ -1,9 +1,10 @@
 package client
 
 import (
+	"crypto/tls"
 	"encoding/binary"
-	"errors"
 	"fmt"
+	"github.com/RedTeamPentesting/kbtls"
 	"github.com/armon/go-socks5"
 	"github.com/hashicorp/yamux"
 	"log"
@@ -11,7 +12,11 @@ import (
 )
 
 func StartClient(remoteAddr string, remoteSocksPort int, username string, password string, serverAuth string) error {
-	conn, err := net.Dial("tcp", remoteAddr)
+	tlsConfig, err := clientTLSConfig(serverAuth)
+	if err != nil {
+		return err
+	}
+	conn, err := tls.Dial("tcp", remoteAddr, tlsConfig)
 	if err != nil {
 		return err
 	}
@@ -27,7 +32,7 @@ func StartClient(remoteAddr string, remoteSocksPort int, username string, passwo
 		return err
 	}
 	defer communicate.Close()
-	err = initConn(communicate, remoteSocksPort, serverAuth)
+	err = initConn(communicate, remoteSocksPort)
 	if err != nil {
 		return err
 	}
@@ -58,24 +63,10 @@ func sendToServer(data string, conn net.Conn) (int, error) {
 	return conn.Write(append(dataLenBytes, data...))
 }
 
-func initConn(conn net.Conn, port int, auth string) error {
-	// do auth with server
-	_, err := sendToServer(auth, conn)
-	if err != nil {
-		return err
-	}
-	authResult := make([]byte, 4)
-	_, err = conn.Read(authResult)
-	if err != nil {
-		return errors.New("auth failed")
-	}
-	if binary.BigEndian.Uint32(authResult) == 0 {
-		_ = conn.Close()
-		return fmt.Errorf("auth server with secret: %s failed", auth)
-	}
+func initConn(conn net.Conn, port int) error {
 	portBytes := make([]byte, 2)
 	binary.BigEndian.PutUint16(portBytes, uint16(port))
-	_, err = conn.Write(portBytes)
+	_, err := conn.Write(portBytes)
 	if err != nil {
 		return err
 	}
@@ -88,4 +79,17 @@ type remoteLogger struct {
 
 func (logger *remoteLogger) Write(data []byte) (int, error) {
 	return sendToServer(string(data), logger.conn)
+}
+
+func clientTLSConfig(connectionKey string) (*tls.Config, error) {
+	key, err := kbtls.ParseConnectionKey(connectionKey)
+	if err != nil {
+		return nil, fmt.Errorf("parse connection key: %w", err)
+	}
+	cfg, err := kbtls.ClientTLSConfig(key)
+	if err != nil {
+		return nil, fmt.Errorf("configure TLS: %w", err)
+	}
+	return cfg, nil
+
 }

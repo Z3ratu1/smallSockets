@@ -3,6 +3,7 @@ module smallSockets
 go 1.20
 
 require (
+	github.com/RedTeamPentesting/kbtls v0.1.1
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/hashicorp/yamux v0.1.1
 	github.com/sirupsen/logrus v1.9.2

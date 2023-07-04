@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"github.com/sirupsen/logrus"
@@ -31,9 +33,8 @@ func init() {
 
 	clientCmd := &cobra.Command{
 		Use:   "client [server addr] [listening port]",
-		Short: "connect to server to provide socks5 service",
-		Long: `connect to server's control port to start socks5 service, <listen port> is the port that server listen.` +
-			`you may provide username and password for socks5 service(optional)`,
+		Short: "connect to server to provide socks5 service, server addr contain ip:port, listening port is the socks5 port server listening at",
+		Long:  `eg: client 192.168.68.1:7890 12345 will connect back to server at 192.168.68.1:7890, and server will open port 12345 as socks5 proxy`,
 		Args: func(cmd *cobra.Command, args []string) error {
 			// Optionally run one of the validators provided by cobra
 			// ExactArgs的返回值是一个函数，这个函数再对args进行检查然后返回error...
@@ -57,6 +58,12 @@ func init() {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			port, _ := strconv.Atoi(args[1])
+			if len(auth) < 10 {
+				return errors.New("your auth string need to be longer than 10 character")
+			}
+			authBytes := sha256.Sum256([]byte(auth))
+			authBytesSlice := authBytes[:]
+			auth = base64.RawStdEncoding.EncodeToString(authBytesSlice)
 			return client.StartClient(args[0], port, proxyUser, proxyPass, auth)
 		},
 	}
@@ -68,8 +75,7 @@ func init() {
 
 	serverCmd := &cobra.Command{
 		Use:   "server [control port]",
-		Short: "start server at control port",
-		Long:  "start server at control port, the socks5 proxy port is specified by client",
+		Short: "start listener at control port, wait for client connect back",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
 				return err
@@ -96,14 +102,22 @@ func init() {
 			default:
 				level = logrus.InfoLevel
 			}
+			// 为什么要多定义一个变量才能用? tls的key要求是一个[32]byte，所以直接取hash刚好32位
+			if len(auth) < 10 {
+				return errors.New("your auth string need to be longer than 10 character")
+			}
+			authBytes := sha256.Sum256([]byte(auth))
+			authBytesSlice := authBytes[:]
+			auth = base64.RawStdEncoding.EncodeToString(authBytesSlice)
 			return server.StartServer(port, auth, level)
 		},
 	}
 
-	rootCmd.PersistentFlags().StringVarP(&auth, "auth", "a", "", "auth string between client and server(optional)")
+	rootCmd.PersistentFlags().StringVarP(&auth, "auth", "a", "smallSockets", "auth string between client and server(optional)")
 	rootCmd.PersistentFlags().StringVarP(&logLevel, "level", "l", "", "log lever(debug/info/error)(optional)")
 	rootCmd.AddCommand(clientCmd)
 	rootCmd.AddCommand(serverCmd)
+
 }
 
 func main() {
